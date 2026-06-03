@@ -1,0 +1,8 @@
+services:
+  gemini-web2api:
+    build: .
+    container_name: gemini-web2api
+    network_mode: host
+    volumes:
+      - ./config.json:/app/config.json
+    restart: unless-stopped

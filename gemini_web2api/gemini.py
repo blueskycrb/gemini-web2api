@@ -22,6 +22,15 @@ _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
 
 
+class GeminiUpstreamError(RuntimeError):
+    """Gemini Web returned an error payload or no usable text."""
+
+    def __init__(self, message: str, code: str = None, raw_excerpt: str = None):
+        super().__init__(message)
+        self.code = code
+        self.raw_excerpt = raw_excerpt
+
+
 def log(msg: str):
     if CONFIG["log_requests"]:
         import sys
@@ -156,6 +165,47 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def _raw_excerpt(raw: str, limit: int = 500) -> str:
+    compact = " ".join((raw or "").split())
+    return compact[:limit]
+
+
+def parse_upstream_error(raw: str) -> GeminiUpstreamError:
+    """Return a structured upstream error if Gemini Web sent one."""
+    if not raw:
+        return None
+    m = re.search(r'BardErrorInfo\s*\[([^\]]+)\]', raw)
+    if m:
+        code = m.group(1).strip()
+        return GeminiUpstreamError(
+            f"Gemini Web upstream returned BardErrorInfo [{code}]",
+            code=f"bard_error_{code}",
+            raw_excerpt=_raw_excerpt(raw),
+        )
+    return None
+
+
+def ensure_response_text(text: str, raw: str, stream: bool = False) -> str:
+    """Validate that a Gemini response has usable text unless configured otherwise."""
+    if text:
+        return text
+    upstream_error = parse_upstream_error(raw)
+    if upstream_error:
+        log(f"Upstream Gemini error: {upstream_error}; excerpt={upstream_error.raw_excerpt}")
+        raise upstream_error
+    policy = (CONFIG.get("empty_response_policy") or "error").lower()
+    if policy == "null":
+        return text
+    kind = "streaming response" if stream else "response"
+    err = GeminiUpstreamError(
+        f"Gemini Web upstream returned an empty {kind}",
+        code="empty_response",
+        raw_excerpt=_raw_excerpt(raw),
+    )
+    log(f"Upstream Gemini empty {kind}; excerpt={err.raw_excerpt}")
+    raise err
+
+
 def _extract_texts_from_line(line: str) -> list:
     """Parse a single wrb.fr line and return list of text strings found."""
     if '"wrb.fr"' not in line or len(line) < 200:
@@ -210,8 +260,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            return ensure_response_text(extract_response_text(raw), raw)
         except Exception as e:
+            if isinstance(e, GeminiUpstreamError):
+                raise
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -236,9 +288,13 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             prev_text = ""
+            raw_tail = ""
+            yielded = False
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
+                    raw_tail = (raw_tail + chunk)[-4000:]
                     buf += chunk
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
@@ -246,10 +302,15 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if len(t) > len(prev_text):
                                 delta = clean_text(t[len(prev_text):])
                                 if delta:
+                                    yielded = True
                                     yield delta
                                 prev_text = t
+            if not yielded:
+                ensure_response_text("", raw_tail, stream=True)
             return
         except Exception as e:
+            if isinstance(e, GeminiUpstreamError):
+                raise
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")

@@ -16,7 +16,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authen
 - **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, no dependencies beyond stdlib
+- **Cross-Platform**: Pure Python, stdlib fallback with `httpx`-enhanced streaming
 - **Streaming**: SSE streaming support
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
@@ -67,6 +67,8 @@ export GEMINI_API_KEY=none
 export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
 gemini
 ```
+
+If `api_keys` is configured in `config.json`, set `GEMINI_API_KEY` to one of those keys.
 
 Supports Google native API endpoints:
 - `GET /v1beta/models` — list models
@@ -159,14 +161,18 @@ Create `config.json` in the same directory:
   "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
   "auth_user": null,
   "xsrf_token": null,
+  "default_model": "gemini-3.5-flash",
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
+  "empty_response_policy": "error",
   "log_requests": true
 }
 ```
 
-When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` and `/v1beta/*` endpoints require a key. OpenAI-compatible clients may use `Authorization: Bearer <key>` or `x-api-key: <key>`; Google-native clients may also use `x-goog-api-key: <key>` or `?key=<key>`.
+
+`empty_response_policy` defaults to `error`. If Gemini Web returns `BardErrorInfo` or no parseable text, the server returns a 502 error instead of a successful response with `content: null`. Set it to `"null"` only if you need the old behavior.
 
 ## Docker
 
@@ -190,6 +196,19 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 ```
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
+
+### Docker bridge empty responses / BardErrorInfo [1060]
+
+Some VPS environments receive upstream `BardErrorInfo [1060]` from Gemini Web when the container uses Docker's default bridge network. Older versions surfaced this as HTTP 200 with `content: null`; this version returns a 502 error so the failure is visible.
+
+If the same config works on the host but fails in Docker bridge mode, try host networking on Linux:
+
+```bash
+cp config.example.json config.json
+docker compose -f docker-compose.host.yml up -d
+```
+
+`network_mode: host` shares the host network stack. In this mode Docker `ports:` mappings do not apply, and the service listens directly on the `host` and `port` from `config.json`. Do not expose an instance without configured `api_keys` to the public internet.
 
 ## Proxy
 
@@ -240,7 +259,7 @@ resp = client.chat.completions.create(
 ## Requirements
 
 - Python 3.8+
-- No external dependencies (stdlib only)
+- Runs with the Python standard library; install `httpx` for true streaming (the Docker image installs it by default)
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
 ## How It Works

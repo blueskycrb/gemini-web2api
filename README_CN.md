@@ -16,7 +16,7 @@
 - **多模型**: Flash, Flash Thinking (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
-- **跨平台**: 纯 Python, 无外部依赖
+- **跨平台**: 纯 Python, 标准库可运行, `httpx` 可增强流式输出
 - **流式输出**: SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
@@ -67,6 +67,8 @@ export GEMINI_API_KEY=none
 export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
 gemini
 ```
+
+如果 `config.json` 配置了 `api_keys`, 请把 `GEMINI_API_KEY` 设置为其中一个密钥.
 
 支持 Google 原生 API 端点:
 - `GET /v1beta/models` — 模型列表
@@ -159,14 +161,18 @@ https://gemini.google.com/u/1/app/...
   "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
   "auth_user": null,
   "xsrf_token": null,
+  "default_model": "gemini-3.5-flash",
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
+  "empty_response_policy": "error",
   "log_requests": true
 }
 ```
 
-`api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
+`api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 与 `/v1beta/*` 接口需要密钥. OpenAI 兼容客户端可使用 `Authorization: Bearer <key>` 或 `x-api-key: <key>`；Gemini 原生客户端也支持 `x-goog-api-key: <key>` 或 `?key=<key>`.
+
+`empty_response_policy` 默认为 `error`. 当 Gemini Web 上游返回 `BardErrorInfo` 或无法解析到正文时, 服务会返回 502 错误, 避免客户端收到 `content: null` 后误以为请求成功. 如果需要保留旧行为, 可设置为 `"null"`.
 
 ## Docker 部署
 
@@ -190,6 +196,19 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 ```
 
 此时 `config.json` 中设置 `"cookie_file": "/app/cookie.txt"`.
+
+### Docker bridge 网络空回复 / BardErrorInfo [1060]
+
+部分 VPS 在 Docker 默认 bridge 网络下访问 Gemini Web 会收到上游 `BardErrorInfo [1060]`, 表现为旧版本返回 200 但 `content: null`. 现在服务会将这类上游错误返回为 502, 方便定位.
+
+如果宿主机直接运行正常、Docker bridge 网络异常, 可在 Linux VPS 上尝试 host 网络:
+
+```bash
+cp config.example.json config.json
+docker compose -f docker-compose.host.yml up -d
+```
+
+`network_mode: host` 会让容器共享宿主机网络栈, 此时 `ports:` 映射不生效, 服务会直接监听 `config.json` 中的 `host` 与 `port`. 不要在公网暴露未配置 `api_keys` 的实例.
 
 ## 代理配置
 
@@ -223,7 +242,7 @@ python gemini_web2api.py
 ## 系统要求
 
 - Python 3.8+
-- 无外部依赖 (仅标准库)
+- 标准库可运行；安装 `httpx` 后支持真正的流式输出 (Docker 镜像默认安装)
 - 需要能访问 `gemini.google.com` (部分地区需代理)
 
 ## 工作原理

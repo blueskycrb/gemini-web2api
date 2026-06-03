@@ -9,6 +9,9 @@ from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
 
+DEFAULT_API_KEYS = {"sk-gemini", "sk-your-key", "sk-change-me"}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gemini Web to OpenAI API")
     parser.add_argument("--port", type=int, default=None)
@@ -32,12 +35,16 @@ def main():
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")
-    print(f"  Listening: http://0.0.0.0:{port}")
+    print(f"  Listening: http://{CONFIG['host']}:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
+    if not CONFIG.get("api_keys"):
+        print("  Warning:   API authentication is disabled (api_keys is empty)")
+    elif any(k in DEFAULT_API_KEYS for k in CONFIG.get("api_keys", [])):
+        print("  Warning:   replace the example api_keys value before exposing this service")
     print()
     try:
         server.serve_forever()

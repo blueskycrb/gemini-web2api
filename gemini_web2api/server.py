@@ -5,10 +5,11 @@ import uuid
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from urllib.parse import urlsplit, parse_qs
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import GeminiUpstreamError, generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
@@ -53,6 +54,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_error_json(self, message: str, status=500, code: str = None):
+        error = {"message": message}
+        if code:
+            error["code"] = code
+        self.send_json({"error": error}, status)
+
     def _start_sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -71,8 +78,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not keys:
             return True
         auth = self.headers.get("Authorization", "")
-        key = auth[7:] if auth.startswith("Bearer ") else self.headers.get("x-api-key", "")
+        key = auth[7:] if auth.startswith("Bearer ") else ""
+        if not key:
+            key = self.headers.get("x-api-key", "")
+        if not key:
+            key = self.headers.get("x-goog-api-key", "")
+        if not key:
+            query = parse_qs(urlsplit(self.path).query)
+            key = (query.get("key") or [""])[0]
         return key in keys
+
+    def _path(self):
+        return urlsplit(self.path).path
+
+    def _requires_auth(self):
+        path = self._path()
+        return path.startswith("/v1/") or path.startswith("/v1beta/")
+
+    def _send_upstream_error(self, exc: Exception):
+        code = exc.code if isinstance(exc, GeminiUpstreamError) else None
+        self.send_error_json(f"upstream error: {exc}", 502, code)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -83,22 +108,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1/") and not self._authorized():
-                self.send_json({"error": {"message": "invalid api key"}}, 401)
+            path = self._path()
+            if self._requires_auth() and not self._authorized():
+                self.send_error_json("invalid api key", 401)
                 return
-            if self.path == "/v1/models":
+            if path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -107,18 +133,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1/") and not self._authorized():
-                self.send_json({"error": {"message": "invalid api key"}}, 401)
+            path = self._path()
+            if self._requires_auth() and not self._authorized():
+                self.send_error_json("invalid api key", 401)
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
-            if self.path == "/v1/chat/completions":
+            if path == "/v1/chat/completions":
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path == "/v1/responses":
                 self._handle_responses(body)
-            elif ":generateContent" in self.path:
+            elif path.startswith("/v1beta/models/") and ":generateContent" in path:
                 self._handle_google_generate(body, stream=False)
-            elif ":streamGenerateContent" in self.path:
+            elif path.startswith("/v1beta/models/") and ":streamGenerateContent" in path:
                 self._handle_google_generate(body, stream=True)
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -156,8 +183,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and (not tools or tool_choice == "none"):
             try:
+                stream_iter = generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+                try:
+                    first_delta = next(stream_iter)
+                except StopIteration:
+                    self.send_error_json("upstream error: Gemini Web upstream returned an empty streaming response", 502, "empty_response")
+                    return
+                except Exception as e:
+                    self._send_upstream_error(e)
+                    return
                 self._start_sse()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model_name, "choices": [{"index": 0, "delta": {"content": first_delta}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+                for delta in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -169,12 +209,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                log(f"Stream error after response started: {e}")
             return
 
         try:
             text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e)
             return
 
         tool_calls = None
@@ -265,7 +307,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e)
             return
 
         tool_calls = None
@@ -335,9 +377,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not has_tools:
             try:
+                stream_iter = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
+                try:
+                    first_delta = next(stream_iter)
+                except StopIteration:
+                    self.send_error_json("upstream error: Gemini Web upstream returned an empty streaming response", 502, "empty_response")
+                    return
+                except Exception as e:
+                    self._send_upstream_error(e)
+                    return
                 self._start_sse()
-                full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                full_text = first_delta
+                chunk_obj = {
+                    "candidates": [{"content": {"parts": [{"text": first_delta}], "role": "model"}, "index": 0}],
+                    "modelVersion": model_name,
+                }
+                self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+                for delta in stream_iter:
                     if not delta:
                         continue
                     full_text += delta
@@ -360,12 +417,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                log(f"Google stream error after response started: {e}")
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e)
             return
 
         if not text:
