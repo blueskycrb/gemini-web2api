@@ -13,5 +13,6 @@
   ],
   "cookie_file": null,
   "proxy": null,
+  "empty_response_policy": "error",
   "log_requests": true
 }

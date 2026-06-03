@@ -163,11 +163,14 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
+  "empty_response_policy": "error",
   "log_requests": true
 }
 ```
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
+
+`empty_response_policy` 默认为 `error`. 当 Gemini Web 上游返回 `BardErrorInfo` 或无法解析到正文时, 服务会返回 502 错误, 避免客户端收到 `content: null` 后误以为请求成功. 如需保留旧行为, 可设置为 `"null"`.
 
 ## Docker 部署
 
@@ -191,6 +194,19 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 ```
 
 此时 `config.json` 中设置 `"cookie_file": "/app/cookie.txt"`.
+
+### Docker bridge 网络空回复 / BardErrorInfo [1060]
+
+部分 VPS 在 Docker 默认 bridge 网络下访问 Gemini Web 会收到上游 `BardErrorInfo [1060]`, 旧行为会表现为 200 但 `content: null`. 当前版本会把这类上游异常返回为 502, 便于定位.
+
+如果同一份配置在宿主机直接运行正常、Docker bridge 网络异常, 可在 Linux VPS 上尝试 host 网络:
+
+```bash
+cp config.example.json config.json
+docker compose -f docker-compose.host.yml up -d
+```
+
+`network_mode: host` 会让容器共享宿主机网络栈, 此时 `ports:` 映射不生效, 服务会直接监听 `config.json` 中的 `host` 与 `port`. 不要在公网暴露未配置有效 `api_keys` 的实例.
 
 ## 代理配置
 
