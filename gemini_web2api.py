@@ -23,6 +23,7 @@ How it works:
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 import time
 import ssl
 import sys
@@ -59,6 +60,7 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
+    "empty_response_policy": "error",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -100,6 +102,15 @@ def log(msg: str):
     if CONFIG["log_requests"]:
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
+
+
+class GeminiUpstreamError(RuntimeError):
+    """Gemini Web returned an error payload or no usable text."""
+
+    def __init__(self, message: str, code: str = None, raw_excerpt: str = None):
+        super().__init__(message)
+        self.code = code
+        self.raw_excerpt = raw_excerpt
 
 
 def load_cookie() -> tuple:
@@ -206,7 +217,12 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace")
+            raise_http_upstream_error(e.code, raw)
         except Exception as e:
+            if isinstance(e, GeminiUpstreamError):
+                raise
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -267,17 +283,23 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
         raw = gemini_stream_generate(prompt, model_id, think_mode)
-        text = extract_response_text(raw)
+        text = ensure_response_text(extract_response_text(raw), raw, stream=True)
         if text:
             yield text
         return
 
     prev_text = ""
+    raw_tail = ""
+    yielded = False
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         with client.stream("POST", url, content=body, headers=headers) as resp:
+            if resp.status_code >= 400:
+                raw = resp.read().decode("utf-8", errors="replace")
+                raise_http_upstream_error(resp.status_code, raw, stream=True)
             buf = ""
             for chunk in resp.iter_text():
+                raw_tail = (raw_tail + chunk)[-4000:]
                 buf += chunk
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
@@ -297,10 +319,13 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
                                             delta = t[len(prev_text):]
                                             delta = clean_gemini_text(delta)
                                             if delta:
+                                                yielded = True
                                                 yield delta
                                             prev_text = t
                     except (json.JSONDecodeError, IndexError, TypeError):
                         pass
+    if not yielded:
+        ensure_response_text("", raw_tail, stream=True)
 
 
 def clean_gemini_text(text: str) -> str:
@@ -310,6 +335,62 @@ def clean_gemini_text(text: str) -> str:
         '', text, flags=re.DOTALL
     )
     return text.strip()
+
+
+def _raw_excerpt(raw: str, limit: int = 500) -> str:
+    compact = " ".join((raw or "").split())
+    return compact[:limit]
+
+
+def parse_upstream_error(raw: str) -> GeminiUpstreamError:
+    """Return a structured upstream error if Gemini Web sent one."""
+    if not raw:
+        return None
+    m = re.search(r'BardErrorInfo\s*\[([^\]]+)\]', raw)
+    if m:
+        code = m.group(1).strip()
+        return GeminiUpstreamError(
+            f"Gemini Web upstream returned BardErrorInfo [{code}]",
+            code=f"bard_error_{code}",
+            raw_excerpt=_raw_excerpt(raw),
+        )
+    return None
+
+
+def ensure_response_text(text: str, raw: str, stream: bool = False) -> str:
+    """Validate that a Gemini response has usable text unless configured otherwise."""
+    if text:
+        return text
+    upstream_error = parse_upstream_error(raw)
+    if upstream_error:
+        log(f"Upstream Gemini error: {upstream_error}; excerpt={upstream_error.raw_excerpt}")
+        raise upstream_error
+    policy = (CONFIG.get("empty_response_policy") or "error").lower()
+    if policy == "null":
+        return text
+    kind = "streaming response" if stream else "response"
+    err = GeminiUpstreamError(
+        f"Gemini Web upstream returned an empty {kind}",
+        code="empty_response",
+        raw_excerpt=_raw_excerpt(raw),
+    )
+    log(f"Upstream Gemini empty {kind}; excerpt={err.raw_excerpt}")
+    raise err
+
+
+def raise_http_upstream_error(status_code: int, raw: str, stream: bool = False):
+    upstream_error = parse_upstream_error(raw)
+    if upstream_error:
+        log(f"Upstream Gemini HTTP {status_code}: {upstream_error}; excerpt={upstream_error.raw_excerpt}")
+        raise upstream_error
+    kind = "streaming response" if stream else "response"
+    err = GeminiUpstreamError(
+        f"Gemini Web upstream returned HTTP {status_code} for {kind}",
+        code=f"http_{status_code}",
+        raw_excerpt=_raw_excerpt(raw),
+    )
+    log(f"Upstream Gemini HTTP {status_code}; excerpt={err.raw_excerpt}")
+    raise err
 
 
 def extract_response_text(raw: str) -> str:
@@ -428,6 +509,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_error_json(self, message: str, status=500, code: str = None):
+        error = {"message": message}
+        if code:
+            error["code"] = code
+        self.send_json({"error": error}, status)
+
+    def _send_upstream_error(self, exc: Exception):
+        code = exc.code if isinstance(exc, GeminiUpstreamError) else None
+        self.send_error_json(f"upstream error: {exc}", 502, code)
+
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
         if not keys:
@@ -504,7 +595,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _call_gemini(self, prompt, model_id, think_mode, tools):
         raw = gemini_stream_generate(prompt, model_id, think_mode)
-        text = extract_response_text(raw)
+        text = ensure_response_text(extract_response_text(raw), raw)
         tool_calls = None
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
@@ -530,12 +621,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and not tools:
             # True streaming: forward chunks as they arrive
             try:
+                stream_iter = gemini_stream_generate_iter(prompt, model_id, think_mode)
+                try:
+                    first_delta = next(stream_iter)
+                except StopIteration:
+                    self.send_error_json("upstream error: Gemini Web upstream returned an empty streaming response", 502, "empty_response")
+                    return
+                except Exception as e:
+                    self._send_upstream_error(e)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model_name, "choices": [{"index": 0, "delta": {"content": first_delta}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+                for delta_text in stream_iter:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -556,7 +660,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e)
             return
 
         msg = {"role": "assistant", "content": text or None}
@@ -645,7 +749,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e)
             return
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
@@ -750,7 +854,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             text, _ = self._call_gemini(prompt, model_id, think_mode, None)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e)
             return
 
         candidate = {

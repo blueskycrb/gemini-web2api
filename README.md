@@ -163,11 +163,14 @@ Create `config.json` in the same directory:
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
+  "empty_response_policy": "error",
   "log_requests": true
 }
 ```
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+`empty_response_policy` defaults to `error`. If Gemini Web returns `BardErrorInfo` or no parseable text, the server returns a 502 error instead of a successful response with `content: null`. Set it to `"null"` only if you need the old behavior.
 
 ## Docker
 
@@ -191,6 +194,19 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 ```
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
+
+### Docker bridge empty responses / BardErrorInfo [1060]
+
+Some VPS environments receive upstream `BardErrorInfo [1060]` from Gemini Web when the container uses Docker's default bridge network. Older behavior surfaced this as HTTP 200 with `content: null`; this version returns a 502 error so the failure is visible.
+
+If the same config works on the host but fails in Docker bridge mode, try host networking on Linux:
+
+```bash
+cp config.example.json config.json
+docker compose -f docker-compose.host.yml up -d
+```
+
+`network_mode: host` shares the host network stack. In this mode Docker `ports:` mappings do not apply, and the service listens directly on the `host` and `port` from `config.json`. Do not expose an instance without valid configured `api_keys` to the public internet.
 
 ## Proxy
 
