@@ -33,8 +33,6 @@ import os
 import hashlib
 import argparse
 import base64
-import threading
-from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -51,6 +49,7 @@ __version__ = "1.1.0"
 # Optional inline Gemini Web cookie for local single-file use.
 # Keep these blank in public repositories. Paste real cookies only in a private copy.
 INLINE_COOKIE = ""
+
 INLINE_SAPISID = ""
 
 DEFAULT_CONFIG = {
@@ -62,29 +61,15 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.5-flash",
+    "default_model": "gemini-3.1-pro",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
-    "api_keys": [],
+    "api_keys": ["sk-Be28AosTSJZEhIf4f"],
     "empty_response_policy": "error",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
-
-STATS_LOCK = threading.Lock()
-REQUEST_STATS = {
-    "started_at": int(time.time()),
-    "total_requests": 0,
-    "successful_requests": 0,
-    "failed_requests": 0,
-    "streaming_requests": 0,
-    "total_prompt_tokens": 0,
-    "total_completion_tokens": 0,
-    "total_tokens": 0,
-    "by_model": {},
-    "recent": deque(maxlen=50),
-}
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
@@ -100,7 +85,7 @@ MODELS = {
         "desc": "Deep thinking mode, longest output (~20k chars)",
     },
     "gemini-3.1-pro": {
-        "mode": 3, "think": 4,
+        "mode": 3, "think": 2,
         "desc": "Pro model (requires cookie for real routing)",
     },
     "gemini-auto": {
@@ -123,393 +108,6 @@ def log(msg: str):
     if CONFIG["log_requests"]:
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
-
-
-def estimate_tokens(text: str) -> int:
-    """Rough token estimate used by the OpenAI-compatible usage fields."""
-    return len(text or "") // 4
-
-
-def record_usage(endpoint: str, model: str, prompt: str, completion: str,
-                 success: bool, stream: bool, started_at: float, error: str = None):
-    prompt_tokens = estimate_tokens(prompt)
-    completion_tokens = estimate_tokens(completion)
-    total_tokens = prompt_tokens + completion_tokens
-    latency_ms = int((time.time() - started_at) * 1000) if started_at else None
-    model_name = model or "unknown"
-
-    with STATS_LOCK:
-        REQUEST_STATS["total_requests"] += 1
-        if success:
-            REQUEST_STATS["successful_requests"] += 1
-        else:
-            REQUEST_STATS["failed_requests"] += 1
-        if stream:
-            REQUEST_STATS["streaming_requests"] += 1
-        REQUEST_STATS["total_prompt_tokens"] += prompt_tokens
-        REQUEST_STATS["total_completion_tokens"] += completion_tokens
-        REQUEST_STATS["total_tokens"] += total_tokens
-
-        by_model = REQUEST_STATS["by_model"].setdefault(model_name, {
-            "requests": 0,
-            "successes": 0,
-            "failures": 0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        })
-        by_model["requests"] += 1
-        by_model["successes" if success else "failures"] += 1
-        by_model["prompt_tokens"] += prompt_tokens
-        by_model["completion_tokens"] += completion_tokens
-        by_model["total_tokens"] += total_tokens
-
-        item = {
-            "time": int(time.time()),
-            "endpoint": endpoint,
-            "model": model_name,
-            "status": "ok" if success else "error",
-            "stream": bool(stream),
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "latency_ms": latency_ms,
-        }
-        if error:
-            item["error"] = str(error)[:180]
-        REQUEST_STATS["recent"].append(item)
-
-
-def stats_snapshot() -> dict:
-    with STATS_LOCK:
-        by_model = []
-        for name, data in REQUEST_STATS["by_model"].items():
-            row = dict(data)
-            row["model"] = name
-            by_model.append(row)
-        by_model.sort(key=lambda row: row["total_tokens"], reverse=True)
-
-        return {
-            "started_at": REQUEST_STATS["started_at"],
-            "uptime_sec": max(0, int(time.time()) - REQUEST_STATS["started_at"]),
-            "total_requests": REQUEST_STATS["total_requests"],
-            "successful_requests": REQUEST_STATS["successful_requests"],
-            "failed_requests": REQUEST_STATS["failed_requests"],
-            "streaming_requests": REQUEST_STATS["streaming_requests"],
-            "total_prompt_tokens": REQUEST_STATS["total_prompt_tokens"],
-            "total_completion_tokens": REQUEST_STATS["total_completion_tokens"],
-            "total_tokens": REQUEST_STATS["total_tokens"],
-            "by_model": by_model,
-            "recent": list(reversed(REQUEST_STATS["recent"])),
-            "requires_api_key": bool(CONFIG.get("api_keys")),
-            "version": __version__,
-        }
-
-
-def dashboard_html() -> str:
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>gemini-web2api dashboard</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f5f7f4;
-      --ink: #17201b;
-      --muted: #647067;
-      --line: #d7ddd6;
-      --panel: #ffffff;
-      --accent: #1b6b55;
-      --accent-2: #ba5b35;
-      --soft: #eaf0ea;
-      --danger: #a13a34;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: Georgia, "Times New Roman", serif;
-    }
-    main {
-      width: min(1180px, calc(100vw - 32px));
-      margin: 0 auto;
-      padding: 28px 0 44px;
-    }
-    header {
-      display: flex;
-      align-items: end;
-      justify-content: space-between;
-      gap: 18px;
-      border-bottom: 1px solid var(--line);
-      padding-bottom: 18px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 30px;
-      font-weight: 700;
-      letter-spacing: 0;
-    }
-    .sub {
-      margin-top: 6px;
-      color: var(--muted);
-      font-size: 14px;
-      font-family: "Trebuchet MS", Verdana, sans-serif;
-    }
-    .keybox {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      min-width: min(420px, 100%);
-      font-family: "Trebuchet MS", Verdana, sans-serif;
-    }
-    input {
-      width: 100%;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-      border-radius: 6px;
-      padding: 10px 12px;
-      font: inherit;
-    }
-    button {
-      border: 0;
-      border-radius: 6px;
-      background: var(--accent);
-      color: #fff;
-      padding: 10px 14px;
-      cursor: pointer;
-      font: inherit;
-      white-space: nowrap;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin: 22px 0;
-    }
-    .metric, .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-    }
-    .metric {
-      padding: 16px;
-      min-height: 112px;
-    }
-    .metric span, th {
-      color: var(--muted);
-      font-family: "Trebuchet MS", Verdana, sans-serif;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-    }
-    .metric strong {
-      display: block;
-      margin-top: 18px;
-      font-size: 30px;
-      line-height: 1;
-    }
-    .split {
-      display: grid;
-      grid-template-columns: 1fr 1.4fr;
-      gap: 12px;
-    }
-    .panel {
-      overflow: hidden;
-    }
-    .panel h2 {
-      margin: 0;
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-      font-size: 17px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-family: "Trebuchet MS", Verdana, sans-serif;
-      font-size: 13px;
-    }
-    th, td {
-      padding: 12px 14px;
-      text-align: left;
-      border-bottom: 1px solid var(--soft);
-      vertical-align: top;
-    }
-    tr:last-child td { border-bottom: 0; }
-    .num { text-align: right; font-variant-numeric: tabular-nums; }
-    .ok { color: var(--accent); font-weight: 700; }
-    .error { color: var(--danger); font-weight: 700; }
-    .bar {
-      height: 7px;
-      border-radius: 999px;
-      background: var(--soft);
-      overflow: hidden;
-      margin-top: 7px;
-    }
-    .bar i {
-      display: block;
-      height: 100%;
-      width: var(--w, 0%);
-      background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    }
-    .empty {
-      padding: 24px 16px;
-      color: var(--muted);
-      font-family: "Trebuchet MS", Verdana, sans-serif;
-    }
-    footer {
-      margin-top: 16px;
-      color: var(--muted);
-      font-family: "Trebuchet MS", Verdana, sans-serif;
-      font-size: 12px;
-    }
-    @media (max-width: 860px) {
-      header, .split { display: block; }
-      .keybox { margin-top: 16px; }
-      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .panel { margin-top: 12px; }
-    }
-    @media (max-width: 520px) {
-      main { width: min(100vw - 20px, 1180px); padding-top: 18px; }
-      .grid { grid-template-columns: 1fr; }
-      h1 { font-size: 24px; }
-      th, td { padding: 10px 8px; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <header>
-      <div>
-        <h1>gemini-web2api dashboard</h1>
-        <div class="sub" id="status">Loading runtime stats...</div>
-      </div>
-      <div class="keybox" id="keybox" hidden>
-        <input id="apiKey" type="password" placeholder="API key">
-        <button id="saveKey" type="button">Connect</button>
-      </div>
-    </header>
-
-    <section class="grid">
-      <div class="metric"><span>Total requests</span><strong id="totalRequests">0</strong></div>
-      <div class="metric"><span>Total tokens</span><strong id="totalTokens">0</strong></div>
-      <div class="metric"><span>Success rate</span><strong id="successRate">0%</strong></div>
-      <div class="metric"><span>Uptime</span><strong id="uptime">0s</strong></div>
-    </section>
-
-    <section class="split">
-      <div class="panel">
-        <h2>Models</h2>
-        <div id="modelsEmpty" class="empty">No model usage yet.</div>
-        <table id="modelsTable" hidden>
-          <thead><tr><th>Model</th><th class="num">Req</th><th class="num">Tokens</th></tr></thead>
-          <tbody id="modelsBody"></tbody>
-        </table>
-      </div>
-      <div class="panel">
-        <h2>Recent requests</h2>
-        <div id="recentEmpty" class="empty">No requests yet.</div>
-        <table id="recentTable" hidden>
-          <thead><tr><th>Time</th><th>Model</th><th>Status</th><th class="num">Tokens</th><th class="num">Latency</th></tr></thead>
-          <tbody id="recentBody"></tbody>
-        </table>
-      </div>
-    </section>
-    <footer>Token counts are rough estimates from text length. Prompt and response contents are not stored.</footer>
-  </main>
-  <script>
-    const keybox = document.getElementById('keybox');
-    const apiKeyInput = document.getElementById('apiKey');
-    const saveKey = document.getElementById('saveKey');
-    const savedKey = localStorage.getItem('gemini_web2api_dashboard_key') || '';
-    apiKeyInput.value = savedKey;
-    saveKey.onclick = () => {
-      localStorage.setItem('gemini_web2api_dashboard_key', apiKeyInput.value.trim());
-      loadStats();
-    };
-
-    function fmt(n) {
-      return new Intl.NumberFormat().format(n || 0);
-    }
-    function uptime(seconds) {
-      seconds = Math.max(0, seconds || 0);
-      const d = Math.floor(seconds / 86400);
-      const h = Math.floor((seconds % 86400) / 3600);
-      const m = Math.floor((seconds % 3600) / 60);
-      if (d) return d + 'd ' + h + 'h';
-      if (h) return h + 'h ' + m + 'm';
-      if (m) return m + 'm';
-      return seconds + 's';
-    }
-    function textCell(value, className) {
-      const td = document.createElement('td');
-      td.textContent = value == null ? '' : value;
-      if (className) td.className = className;
-      return td;
-    }
-    async function loadStats() {
-      const headers = {};
-      const key = localStorage.getItem('gemini_web2api_dashboard_key') || '';
-      if (key) headers.Authorization = 'Bearer ' + key;
-      const res = await fetch('/dashboard/data', { headers });
-      if (res.status === 401) {
-        keybox.hidden = false;
-        document.getElementById('status').textContent = 'Enter your configured API key to view stats.';
-        return;
-      }
-      const data = await res.json();
-      keybox.hidden = !data.requires_api_key;
-      document.getElementById('status').textContent = 'v' + data.version + ' running for ' + uptime(data.uptime_sec);
-      document.getElementById('totalRequests').textContent = fmt(data.total_requests);
-      document.getElementById('totalTokens').textContent = fmt(data.total_tokens);
-      const rate = data.total_requests ? Math.round((data.successful_requests / data.total_requests) * 100) : 0;
-      document.getElementById('successRate').textContent = rate + '%';
-      document.getElementById('uptime').textContent = uptime(data.uptime_sec);
-
-      const modelsBody = document.getElementById('modelsBody');
-      modelsBody.textContent = '';
-      const maxTokens = Math.max(1, ...data.by_model.map(row => row.total_tokens || 0));
-      data.by_model.forEach(row => {
-        const tr = document.createElement('tr');
-        const model = textCell(row.model);
-        const bar = document.createElement('div');
-        bar.className = 'bar';
-        bar.style.setProperty('--w', Math.round((row.total_tokens || 0) / maxTokens * 100) + '%');
-        bar.innerHTML = '<i></i>';
-        model.appendChild(bar);
-        tr.appendChild(model);
-        tr.appendChild(textCell(fmt(row.requests), 'num'));
-        tr.appendChild(textCell(fmt(row.total_tokens), 'num'));
-        modelsBody.appendChild(tr);
-      });
-      document.getElementById('modelsEmpty').hidden = data.by_model.length > 0;
-      document.getElementById('modelsTable').hidden = data.by_model.length === 0;
-
-      const recentBody = document.getElementById('recentBody');
-      recentBody.textContent = '';
-      data.recent.forEach(row => {
-        const tr = document.createElement('tr');
-        tr.appendChild(textCell(new Date(row.time * 1000).toLocaleTimeString()));
-        tr.appendChild(textCell(row.model));
-        tr.appendChild(textCell(row.status, row.status === 'ok' ? 'ok' : 'error'));
-        tr.appendChild(textCell(fmt(row.total_tokens), 'num'));
-        tr.appendChild(textCell(row.latency_ms == null ? '' : row.latency_ms + 'ms', 'num'));
-        recentBody.appendChild(tr);
-      });
-      document.getElementById('recentEmpty').hidden = data.recent.length > 0;
-      document.getElementById('recentTable').hidden = data.recent.length === 0;
-    }
-    loadStats().catch(err => {
-      document.getElementById('status').textContent = 'Dashboard error: ' + err.message;
-    });
-    setInterval(() => loadStats().catch(() => {}), 3000);
-  </script>
-</body>
-</html>"""
 
 
 class GeminiUpstreamError(RuntimeError):
@@ -942,15 +540,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_html(self, html: str, status=200):
-        body = html.encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
     def send_error_json(self, message: str, status=500, code: str = None):
         error = {"message": message}
         if code:
@@ -978,31 +567,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            path = urllib.parse.urlparse(self.path).path
-            if path in ("/dashboard", "/dashboard/"):
-                self.send_html(dashboard_html())
-                return
-            if path == "/dashboard/data":
-                if not self._authorized():
-                    self.send_json({"error": {"message": "invalid api key"}}, 401)
-                    return
-                self.send_json(stats_snapshot())
-                return
-            if path.startswith("/v1/") and not self._authorized():
+            if self.path.startswith("/v1/") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if path == "/v1/models":
+            if self.path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif path.startswith("/v1beta/models"):
+            elif self.path.startswith("/v1beta/models"):
                 self._handle_google_models_list()
-            elif path == "/":
+            elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__,
-                                "models": list(MODELS.keys()),
-                                "dashboard": "/dashboard"})
+                                "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -1070,22 +648,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        started_at = time.time()
 
         if stream and not tools:
             # True streaming: forward chunks as they arrive
-            completion_parts = []
             try:
                 stream_iter = gemini_stream_generate_iter(prompt, model_id, think_mode)
                 try:
                     first_delta = next(stream_iter)
-                    completion_parts.append(first_delta)
                 except StopIteration:
-                    record_usage("/v1/chat/completions", model_name, prompt, "", False, stream, started_at, "empty streaming response")
                     self.send_error_json("upstream error: Gemini Web upstream returned an empty streaming response", 502, "empty_response")
                     return
                 except Exception as e:
-                    record_usage("/v1/chat/completions", model_name, prompt, "", False, stream, started_at, str(e))
                     self._send_upstream_error(e)
                     return
                 self.send_response(200)
@@ -1098,7 +671,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
                 for delta_text in stream_iter:
-                    completion_parts.append(delta_text)
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -1109,11 +681,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-                record_usage("/v1/chat/completions", model_name, prompt, "".join(completion_parts), True, stream, started_at)
             except (BrokenPipeError, ConnectionResetError):
-                record_usage("/v1/chat/completions", model_name, prompt, "".join(completion_parts), False, stream, started_at, "client disconnected")
+                pass
             except Exception as e:
-                record_usage("/v1/chat/completions", model_name, prompt, "".join(completion_parts), False, stream, started_at, str(e))
                 log(f"Stream error: {e}")
             return
 
@@ -1121,10 +691,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
         except Exception as e:
-            record_usage("/v1/chat/completions", model_name, prompt, "", False, stream, started_at, str(e))
             self._send_upstream_error(e)
             return
-        record_usage("/v1/chat/completions", model_name, prompt, text or "", True, stream, started_at)
 
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
@@ -1148,8 +716,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": estimate_tokens(prompt), "completion_tokens": estimate_tokens(text),
-                          "total_tokens": estimate_tokens(prompt) + estimate_tokens(text)},
+                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text)//4,
+                          "total_tokens": (len(prompt)+len(text))//4},
             })
 
     def handle_responses(self, body: bytes):
@@ -1209,15 +777,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
-        started_at = time.time()
-        stream = bool(req.get("stream"))
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
         except Exception as e:
-            record_usage("/v1/responses", model_name, prompt, "", False, stream, started_at, str(e))
             self._send_upstream_error(e)
             return
-        record_usage("/v1/responses", model_name, prompt, text or "", True, stream, started_at)
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -1230,7 +794,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
 
-        if stream:
+        if req.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -1247,15 +811,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
                         self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
             resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": {"input_tokens": estimate_tokens(prompt), "output_tokens": estimate_tokens(text),
-                                  "total_tokens": estimate_tokens(prompt) + estimate_tokens(text)}}
+                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
             self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
-                            "usage": {"input_tokens": estimate_tokens(prompt), "output_tokens": estimate_tokens(text),
-                                      "total_tokens": estimate_tokens(prompt) + estimate_tokens(text)}})
+                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
 
 
     # ─── Google Native API (Gemini CLI compatible) ────────────────────────────
@@ -1320,15 +882,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
-        endpoint = "/v1beta/models:streamGenerateContent" if stream else "/v1beta/models:generateContent"
-        started_at = time.time()
         try:
             text, _ = self._call_gemini(prompt, model_id, think_mode, None)
         except Exception as e:
-            record_usage(endpoint, model_name, prompt, "", False, stream, started_at, str(e))
             self._send_upstream_error(e)
             return
-        record_usage(endpoint, model_name, prompt, text or "", True, stream, started_at)
 
         candidate = {
             "content": {"parts": [{"text": text or ""}], "role": "model"},
@@ -1336,9 +894,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "index": 0,
         }
         usage = {
-            "promptTokenCount": estimate_tokens(prompt),
-            "candidatesTokenCount": estimate_tokens(text),
-            "totalTokenCount": estimate_tokens(prompt) + estimate_tokens(text),
+            "promptTokenCount": len(prompt) // 4,
+            "candidatesTokenCount": len(text) // 4,
+            "totalTokenCount": (len(prompt) + len(text)) // 4,
         }
         response_obj = {
             "candidates": [candidate],
@@ -1400,7 +958,6 @@ def main():
     print(f"gemini-web2api v{__version__}")
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
-    print(f"  Dashboard: http://localhost:{port}/dashboard")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     if INLINE_COOKIE.strip():
         cookie_status = "yes (inline)"
