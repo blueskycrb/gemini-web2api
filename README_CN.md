@@ -103,6 +103,16 @@ gemini-3.5-flash-thinking@think=4   # 最浅
 python gemini_web2api.py --cookie-file cookie.txt
 ```
 
+本地单文件运行时，也可以直接把 cookie 写到 `gemini_web2api.py` 顶部的常量里：
+
+```python
+INLINE_COOKIE = "SID=...; HSID=...; SAPISID=...; __Secure-1PSID=..."
+INLINE_SAPISID = ""  # 可选覆盖；留空会从 cookie 中解析 SAPISID
+```
+
+真实 cookie 不要提交到公开仓库。如果 Docker 使用内联 cookie，修改
+`gemini_web2api.py` 后需要重新构建镜像。
+
 ### 如何获取 Cookie
 
 1. 打开 Chrome, 访问 [gemini.google.com](https://gemini.google.com) 并登录 **Gemini Advanced** 付费账号
