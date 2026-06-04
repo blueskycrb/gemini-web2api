@@ -103,6 +103,17 @@ Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash with
 python gemini_web2api.py --cookie-file cookie.txt
 ```
 
+For local single-file use, you can also paste the cookie into the constants near
+the top of `gemini_web2api.py`:
+
+```python
+INLINE_COOKIE = "SID=...; HSID=...; SAPISID=...; __Secure-1PSID=..."
+INLINE_SAPISID = ""  # optional override; leave blank to parse SAPISID from cookie
+```
+
+Keep real cookies out of public commits. If you use Docker with inline cookies,
+rebuild the image after editing `gemini_web2api.py`.
+
 ### How to get cookies
 
 1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with a **Gemini Advanced** Google account

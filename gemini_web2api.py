@@ -46,6 +46,11 @@ __version__ = "1.1.0"
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
+# Optional inline Gemini Web cookie for local single-file use.
+# Keep these blank in public repositories. Paste real cookies only in a private copy.
+INLINE_COOKIE = ""
+INLINE_SAPISID = ""
+
 DEFAULT_CONFIG = {
     "port": 8081,
     "host": "0.0.0.0",
@@ -114,7 +119,15 @@ class GeminiUpstreamError(RuntimeError):
 
 
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Load cookie from inline constants or file. Returns (cookie_str, sapisid)."""
+    inline_cookie = INLINE_COOKIE.strip()
+    if inline_cookie:
+        try:
+            return parse_cookie_content(inline_cookie, INLINE_SAPISID)
+        except Exception as e:
+            log(f"Inline cookie parse error: {e}")
+            return "", None
+
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file:
         return "", None
@@ -123,18 +136,35 @@ def load_cookie() -> tuple:
     try:
         with open(cookie_file, "r") as f:
             content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
-        return cookie_str, sapisid if sapisid else None
+        return parse_cookie_content(content)
     except Exception as e:
         log(f"Cookie load error: {e}")
         return "", None
+
+
+def parse_cookie_content(content: str, sapisid_override: str = "") -> tuple:
+    """Parse plain or JSON cookie content into (cookie_str, sapisid)."""
+    content = (content or "").strip()
+    if not content:
+        return "", None
+
+    if content.startswith("{"):
+        data = json.loads(content)
+        cookie_str = (data.get("cookie") or "").strip()
+        sapisid = (data.get("sapisid") or "").strip()
+    else:
+        cookie_str = content
+        pairs = {}
+        for part in cookie_str.split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            pairs[key.strip()] = value.strip()
+        sapisid = pairs.get("SAPISID", "")
+
+    if sapisid_override:
+        sapisid = sapisid_override.strip()
+    return cookie_str, sapisid if sapisid else None
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -928,7 +958,13 @@ def main():
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    if INLINE_COOKIE.strip():
+        cookie_status = "yes (inline)"
+    elif CONFIG.get("cookie_file"):
+        cookie_status = f"yes ({CONFIG['cookie_file']})"
+    else:
+        cookie_status = "none (anonymous)"
+    print(f"  Cookie:    {cookie_status}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print()

@@ -68,10 +68,14 @@ class PackageUpstreamErrorTests(unittest.TestCase):
 class MonolithUpstreamErrorTests(unittest.TestCase):
     def setUp(self):
         self._config = dict(monolith.CONFIG)
+        self._inline_cookie = monolith.INLINE_COOKIE
+        self._inline_sapisid = monolith.INLINE_SAPISID
 
     def tearDown(self):
         monolith.CONFIG.clear()
         monolith.CONFIG.update(self._config)
+        monolith.INLINE_COOKIE = self._inline_cookie
+        monolith.INLINE_SAPISID = self._inline_sapisid
 
     def test_monolith_detects_bard_error_info(self):
         err = monolith.parse_upstream_error("BardErrorInfo [1060]")
@@ -96,6 +100,35 @@ class MonolithUpstreamErrorTests(unittest.TestCase):
             monolith.gemini_stream_generate = original
 
         self.assertEqual(cm.exception.code, "bard_error_1060")
+
+    def test_monolith_inline_cookie_takes_precedence(self):
+        monolith.CONFIG["cookie_file"] = "does-not-exist.txt"
+        monolith.INLINE_COOKIE = "SID=sid;SAPISID=sapisid; __Secure-1PSID=psid"
+
+        self.assertEqual(
+            monolith.load_cookie(),
+            ("SID=sid;SAPISID=sapisid; __Secure-1PSID=psid", "sapisid"),
+        )
+
+    def test_monolith_inline_cookie_can_override_sapisid(self):
+        monolith.INLINE_COOKIE = "SID=sid; SAPISID=from_cookie"
+        monolith.INLINE_SAPISID = "from_override"
+
+        self.assertEqual(
+            monolith.load_cookie(),
+            ("SID=sid; SAPISID=from_cookie", "from_override"),
+        )
+
+    def test_monolith_json_cookie_content_still_parses(self):
+        raw = json.dumps({
+            "cookie": "SID=sid; SAPISID=from_json",
+            "sapisid": "from_json",
+        })
+
+        self.assertEqual(
+            monolith.parse_cookie_content(raw),
+            ("SID=sid; SAPISID=from_json", "from_json"),
+        )
 
 
 if __name__ == "__main__":
