@@ -183,6 +183,54 @@ When `api_keys` is `[]`, authentication is disabled. When one or more keys are s
 
 `empty_response_policy` defaults to `error`. If Gemini Web returns `BardErrorInfo` or no parseable text, the server returns a 502 error instead of a successful response with `content: null`. Set it to `"null"` only if you need the old behavior.
 
+## VPS background service
+
+For a quick VPS test, run it with `nohup`:
+
+```bash
+nohup python3 /root/cs.py > /root/gemini-web2api.log 2>&1 &
+tail -f /root/gemini-web2api.log
+```
+
+For long-running VPS use, create a `systemd` service:
+
+```bash
+cat >/etc/systemd/system/gemini-web2api.service <<'EOF'
+[Unit]
+Description=gemini-web2api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 /root/cs.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now gemini-web2api
+systemctl status gemini-web2api
+```
+
+Logs:
+
+```bash
+journalctl -u gemini-web2api -f
+```
+
+The built-in dashboard is available at:
+
+```text
+http://YOUR_VPS_IP:8081/dashboard
+```
+
+If `api_keys` is configured, enter the same key on the dashboard page. Do not expose a public VPS instance without `api_keys` or firewall protection.
+
 ## Docker
 
 ```bash

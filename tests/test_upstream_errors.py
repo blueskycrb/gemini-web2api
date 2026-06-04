@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import time
 import unittest
 
 from gemini_web2api.config import CONFIG
@@ -20,6 +21,20 @@ SPEC = importlib.util.spec_from_file_location(
 )
 monolith = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(monolith)
+
+
+def reset_monolith_stats():
+    with monolith.STATS_LOCK:
+        monolith.REQUEST_STATS["started_at"] = int(time.time())
+        monolith.REQUEST_STATS["total_requests"] = 0
+        monolith.REQUEST_STATS["successful_requests"] = 0
+        monolith.REQUEST_STATS["failed_requests"] = 0
+        monolith.REQUEST_STATS["streaming_requests"] = 0
+        monolith.REQUEST_STATS["total_prompt_tokens"] = 0
+        monolith.REQUEST_STATS["total_completion_tokens"] = 0
+        monolith.REQUEST_STATS["total_tokens"] = 0
+        monolith.REQUEST_STATS["by_model"].clear()
+        monolith.REQUEST_STATS["recent"].clear()
 
 
 class PackageUpstreamErrorTests(unittest.TestCase):
@@ -70,12 +85,14 @@ class MonolithUpstreamErrorTests(unittest.TestCase):
         self._config = dict(monolith.CONFIG)
         self._inline_cookie = monolith.INLINE_COOKIE
         self._inline_sapisid = monolith.INLINE_SAPISID
+        reset_monolith_stats()
 
     def tearDown(self):
         monolith.CONFIG.clear()
         monolith.CONFIG.update(self._config)
         monolith.INLINE_COOKIE = self._inline_cookie
         monolith.INLINE_SAPISID = self._inline_sapisid
+        reset_monolith_stats()
 
     def test_monolith_detects_bard_error_info(self):
         err = monolith.parse_upstream_error("BardErrorInfo [1060]")
@@ -129,6 +146,36 @@ class MonolithUpstreamErrorTests(unittest.TestCase):
             monolith.parse_cookie_content(raw),
             ("SID=sid; SAPISID=from_json", "from_json"),
         )
+
+    def test_monolith_records_usage_without_prompt_or_completion_text(self):
+        monolith.record_usage(
+            "/v1/chat/completions",
+            "gemini-3.1-pro",
+            "hello prompt",
+            "assistant response",
+            True,
+            False,
+            time.time(),
+        )
+
+        snap = monolith.stats_snapshot()
+
+        self.assertEqual(snap["total_requests"], 1)
+        self.assertEqual(snap["successful_requests"], 1)
+        self.assertEqual(snap["by_model"][0]["model"], "gemini-3.1-pro")
+        self.assertEqual(snap["recent"][0]["endpoint"], "/v1/chat/completions")
+        self.assertNotIn("prompt", snap["recent"][0])
+        self.assertNotIn("completion", snap["recent"][0])
+
+    def test_monolith_dashboard_auth_uses_configured_api_key(self):
+        handler = monolith.GeminiHandler.__new__(monolith.GeminiHandler)
+        monolith.CONFIG["api_keys"] = ["sk-test"]
+
+        handler.headers = {"Authorization": "Bearer sk-test"}
+        self.assertTrue(handler._authorized())
+
+        handler.headers = {"Authorization": "Bearer wrong"}
+        self.assertFalse(handler._authorized())
 
 
 if __name__ == "__main__":
