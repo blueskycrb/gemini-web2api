@@ -182,6 +182,54 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 `empty_response_policy` 默认为 `error`. 当 Gemini Web 上游返回 `BardErrorInfo` 或无法解析到正文时, 服务会返回 502 错误, 避免客户端收到 `content: null` 后误以为请求成功. 如需保留旧行为, 可设置为 `"null"`.
 
+## VPS 后台运行
+
+临时测试可以用 `nohup`:
+
+```bash
+nohup python3 /root/cs.py > /root/gemini-web2api.log 2>&1 &
+tail -f /root/gemini-web2api.log
+```
+
+VPS 长期运行建议使用 `systemd`:
+
+```bash
+cat >/etc/systemd/system/gemini-web2api.service <<'EOF'
+[Unit]
+Description=gemini-web2api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 /root/cs.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now gemini-web2api
+systemctl status gemini-web2api
+```
+
+查看日志:
+
+```bash
+journalctl -u gemini-web2api -f
+```
+
+内置统计面板地址:
+
+```text
+http://你的VPS_IP:8081/dashboard
+```
+
+如果配置了 `api_keys`, 面板会要求输入同一个 key 才能读取统计数据。不要在公网暴露未配置 `api_keys` 或防火墙保护的实例。
+
 ## Docker 部署
 
 ```bash
